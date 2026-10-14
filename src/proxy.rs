@@ -85,7 +85,7 @@ impl ProxyEngine {
         let candidates = self.get_ordered_candidates().await;
         if candidates.is_empty() {
             REQUESTS_TOTAL
-                .with_label_values(&[&primary_method, "no_upstream"])
+                .with_label_values(&[primary_method.as_str(), "no_upstream"])
                 .inc();
             return Err(GatewayError::NoHealthyUpstream);
         }
@@ -119,10 +119,10 @@ impl ProxyEngine {
                     if resp.is_success() {
                         let elapsed = start.elapsed().as_secs_f64();
                         REQUEST_DURATION_SECONDS
-                            .with_label_values(&[&primary_method, &candidate.name])
+                            .with_label_values(&[primary_method.as_str(), candidate.name.as_str()])
                             .observe(elapsed);
                         REQUESTS_TOTAL
-                            .with_label_values(&[&primary_method, "success"])
+                            .with_label_values(&[primary_method.as_str(), "success"])
                             .inc();
 
                         return Ok(resp.body);
@@ -170,7 +170,7 @@ impl ProxyEngine {
             if attempt_idx == 0 && retry_safe && total_candidates > 1 {
                 let fallback_name = &candidates[1].name;
                 FAILOVERS_TOTAL
-                    .with_label_values(&[&candidate.name, fallback_name])
+                    .with_label_values(&[candidate.name.as_str(), fallback_name.as_str()])
                     .inc();
                 info!(
                     failed_node = %candidate.name,
@@ -181,7 +181,7 @@ impl ProxyEngine {
         }
 
         REQUESTS_TOTAL
-            .with_label_values(&[&primary_method, "upstream_error"])
+            .with_label_values(&[primary_method.as_str(), "upstream_error"])
             .inc();
 
         Err(GatewayError::UpstreamError(last_error.unwrap_or_else(
