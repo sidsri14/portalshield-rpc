@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  portalshield:
+    build: .
+    container_name: portalshield-gateway
+    restart: unless-stopped
+    ports:
+      - "9944:9944"
+    volumes:
+      - ./config.example.json:/app/config.json:ro
+    environment:
+      - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9944/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
