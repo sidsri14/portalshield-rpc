@@ -1,0 +1,42 @@
+{
+  "captured_at": "2026-10-14T12:44:32.280037500Z",
+  "gateway_version": "0.1.0",
+  "upstream": "wss://mainnet.portaldot.io",
+  "expected_chain": "Portaldot Mainnet",
+  "gateway_health": {
+    "status": "healthy",
+    "healthy_nodes": 1,
+    "available_nodes": 1,
+    "total_nodes": 1
+  },
+  "response_security_headers": {
+    "x_content_type_options": "nosniff",
+    "referrer_policy": "no-referrer",
+    "content_security_policy_includes": "frame-ancestors 'none'"
+  },
+  "upstream_status": {
+    "name": "portaldot-node-1",
+    "status": "Healthy",
+    "block_height": 2725848,
+    "block_lag": 0,
+    "peers": 12,
+    "is_syncing": false,
+    "latency_ms": 3144,
+    "chain_name": "Portaldot Mainnet"
+  },
+  "proxied_request": {
+    "jsonrpc": "2.0",
+    "id": 92,
+    "method": "system_chain",
+    "params": []
+  },
+  "proxied_response": {
+    "jsonrpc": "2.0",
+    "id": 92,
+    "result": "Portaldot Mainnet"
+  },
+  "metrics_sample": {
+    "portalshield_requests_total_system_chain_success": 1,
+    "portalshield_upstream_healthy_portaldot_node_1": 1
+  }
+}

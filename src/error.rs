@@ -85,4 +85,3 @@ mod tests {
         assert_eq!(res["error"]["data"]["policy_action"], "ALL_UPSTREAMS_DOWN");
     }
 }
-

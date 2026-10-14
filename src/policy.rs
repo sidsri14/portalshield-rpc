@@ -18,6 +18,35 @@ pub enum ParsedRpc {
     Batch(Vec<ParsedRpc>),
 }
 
+impl ParsedRpc {
+    pub fn is_retry_safe(&self) -> bool {
+        match self {
+            ParsedRpc::Single { method, .. } => is_retry_safe_method(method),
+            ParsedRpc::Batch(items) => items.iter().all(ParsedRpc::is_retry_safe),
+        }
+    }
+}
+
+fn is_retry_safe_method(method: &str) -> bool {
+    const READ_ONLY_PREFIXES: &[&str] = &[
+        "archive_",
+        "babe_",
+        "chain_",
+        "childstate_",
+        "grandpa_",
+        "mmr_",
+        "payment_",
+        "rpc_",
+        "state_",
+        "sync_state_",
+        "system_",
+    ];
+
+    READ_ONLY_PREFIXES
+        .iter()
+        .any(|prefix| method.starts_with(prefix))
+}
+
 impl PolicyEngine {
     pub fn new(config: PolicyConfig) -> Self {
         Self { config }
@@ -36,8 +65,7 @@ impl PolicyEngine {
         }
 
         // 2. If allowlist is populated, enforce membership
-        if !self.config.allowed_methods.is_empty()
-            && !self.config.allowed_methods.contains(method)
+        if !self.config.allowed_methods.is_empty() && !self.config.allowed_methods.contains(method)
         {
             POLICY_REJECTIONS_TOTAL
                 .with_label_values(&[method, "not_whitelisted"])
@@ -72,12 +100,9 @@ impl PolicyEngine {
     pub fn inspect_value(&self, val: Value) -> Result<ParsedRpc, GatewayError> {
         match val {
             Value::Object(map) => {
-                let method = map
-                    .get("method")
-                    .and_then(|m| m.as_str())
-                    .ok_or_else(|| {
-                        GatewayError::InvalidRequest("Missing or invalid 'method' field".to_string())
-                    })?;
+                let method = map.get("method").and_then(|m| m.as_str()).ok_or_else(|| {
+                    GatewayError::InvalidRequest("Missing or invalid 'method' field".to_string())
+                })?;
 
                 self.check_method(method)?;
 
@@ -97,10 +122,7 @@ impl PolicyEngine {
 
                 let mut parsed_items = Vec::with_capacity(arr.len());
                 for item in arr {
-                    match self.inspect_value(item) {
-                        Ok(p) => parsed_items.push(p),
-                        Err(e) => return Err(e),
-                    }
+                    parsed_items.push(self.inspect_value(item)?);
                 }
                 Ok(ParsedRpc::Batch(parsed_items))
             }

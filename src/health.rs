@@ -3,8 +3,8 @@ use crate::metrics::{
     UPSTREAM_BLOCK_HEIGHT, UPSTREAM_BLOCK_LAG, UPSTREAM_HEALTHY, UPSTREAM_PEERS,
     UPSTREAM_PROBE_LATENCY_MS,
 };
+use crate::transport::RpcClient;
 use chrono::{DateTime, Utc};
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -71,15 +71,12 @@ pub type SharedNodePool = Arc<RwLock<Vec<NodeState>>>;
 pub struct HealthMonitor {
     nodes: SharedNodePool,
     config: HealthConfig,
-    client: Client,
+    client: RpcClient,
 }
 
 impl HealthMonitor {
     pub fn new(nodes: SharedNodePool, config: HealthConfig) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .build()
-            .expect("Failed to create reqwest HTTP client for health monitor");
+        let client = RpcClient::new(Duration::from_millis(config.timeout_ms));
 
         Self {
             nodes,
@@ -89,7 +86,7 @@ impl HealthMonitor {
     }
 
     pub async fn probe_node(
-        client: &Client,
+        client: &RpcClient,
         url: &str,
         expected_chain: Option<&str>,
     ) -> Result<(u64, u32, bool, String, u64), String> {
@@ -103,28 +100,18 @@ impl HealthMonitor {
             "params": []
         });
 
-        let resp = client
-            .post(url)
-            .json(&health_req)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request error: {}", e))?;
+        let health_val = call_jsonrpc(client, url, &health_req, "system_health").await?;
 
-        let health_val: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Invalid JSON from system_health: {}", e))?;
-
-        let (peers, is_syncing) = if let Some(res) = health_val.get("result") {
-            let peers = res.get("peers").and_then(|p| p.as_u64()).unwrap_or(0) as u32;
-            let syncing = res
-                .get("isSyncing")
-                .and_then(|s| s.as_bool())
-                .unwrap_or(false);
-            (peers, syncing)
-        } else {
-            (0, false)
-        };
+        let health_result = rpc_result(&health_val, "system_health")?;
+        let peers = health_result
+            .get("peers")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "system_health result is missing numeric 'peers'".to_string())?
+            as u32;
+        let is_syncing = health_result
+            .get("isSyncing")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "system_health result is missing boolean 'isSyncing'".to_string())?;
 
         // 2. Probe chain_getHeader to extract latest block height
         let header_req = json!({
@@ -134,34 +121,20 @@ impl HealthMonitor {
             "params": []
         });
 
-        let header_resp = client
-            .post(url)
-            .json(&header_req)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP header request error: {}", e))?;
+        let header_val = call_jsonrpc(client, url, &header_req, "chain_getHeader").await?;
 
-        let header_val: Value = header_resp
-            .json()
-            .await
-            .map_err(|e| format!("Invalid JSON from chain_getHeader: {}", e))?;
-
-        let block_height = if let Some(res) = header_val.get("result") {
-            if let Some(num_val) = res.get("number") {
-                if let Some(num_str) = num_val.as_str() {
-                    // Parse hex block number e.g. "0x12a4"
-                    let clean_hex = num_str.trim_start_matches("0x");
-                    u64::from_str_radix(clean_hex, 16).unwrap_or(0)
-                } else if let Some(n) = num_val.as_u64() {
-                    n
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
+        let header_result = rpc_result(&header_val, "chain_getHeader")?;
+        let number = header_result
+            .get("number")
+            .ok_or_else(|| "chain_getHeader result is missing 'number'".to_string())?;
+        let block_height = if let Some(num_str) = number.as_str() {
+            let clean_hex = num_str.strip_prefix("0x").unwrap_or(num_str);
+            u64::from_str_radix(clean_hex, 16)
+                .map_err(|e| format!("Invalid block number '{}': {}", num_str, e))?
         } else {
-            0
+            number
+                .as_u64()
+                .ok_or_else(|| "chain_getHeader 'number' is not a string or integer".to_string())?
         };
 
         // 3. Probe system_chain
@@ -172,22 +145,11 @@ impl HealthMonitor {
             "params": []
         });
 
-        let chain_resp = client
-            .post(url)
-            .json(&chain_req)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP chain request error: {}", e))?;
+        let chain_val = call_jsonrpc(client, url, &chain_req, "system_chain").await?;
 
-        let chain_val: Value = chain_resp
-            .json()
-            .await
-            .map_err(|e| format!("Invalid JSON from system_chain: {}", e))?;
-
-        let chain_name = chain_val
-            .get("result")
-            .and_then(|c| c.as_str())
-            .unwrap_or("Unknown")
+        let chain_name = rpc_result(&chain_val, "system_chain")?
+            .as_str()
+            .ok_or_else(|| "system_chain result is not a string".to_string())?
             .to_string();
 
         let latency_ms = start.elapsed().as_millis() as u64;
@@ -214,12 +176,8 @@ impl HealthMonitor {
                 (pool[i].url.clone(), pool[i].name.clone())
             };
 
-            let res = Self::probe_node(
-                &self.client,
-                &url,
-                self.config.expected_chain.as_deref(),
-            )
-            .await;
+            let res =
+                Self::probe_node(&self.client, &url, self.config.expected_chain.as_deref()).await;
 
             results.push((i, name, url, res));
         }
@@ -235,7 +193,7 @@ impl HealthMonitor {
         }
 
         let mut pool = self.nodes.write().await;
-        for (i, name, url, res) in results {
+        for (i, name, _url, res) in results {
             let node = &mut pool[i];
             node.last_probe = Some(Utc::now());
 
@@ -312,7 +270,6 @@ impl HealthMonitor {
                     warn!(
                         target: "portalshield::health",
                         node = %name,
-                        url = %url,
                         error = %err,
                         "Portaldot upstream probe failed; node marked DOWN"
                     );
@@ -329,9 +286,43 @@ impl HealthMonitor {
                 "Started Portaldot RPC upstream health monitor loop"
             );
             loop {
-                self.run_probe_cycle().await;
                 tokio::time::sleep(interval_duration).await;
+                self.run_probe_cycle().await;
             }
         })
     }
+}
+
+fn rpc_result<'a>(value: &'a Value, method: &str) -> Result<&'a Value, String> {
+    if let Some(error) = value.get("error") {
+        return Err(format!("{} returned JSON-RPC error: {}", method, error));
+    }
+
+    value
+        .get("result")
+        .ok_or_else(|| format!("{} response is missing 'result'", method))
+}
+
+async fn call_jsonrpc(
+    client: &RpcClient,
+    url: &str,
+    payload: &Value,
+    method: &str,
+) -> Result<Value, String> {
+    let request = serde_json::to_vec(payload)
+        .map_err(|error| format!("Failed to serialize {} request: {}", method, error))?;
+    let response = client.call(url, &request).await?;
+
+    if !response.is_success() {
+        let status = response.status.ok_or_else(|| {
+            format!(
+                "{} returned an unsuccessful response without an HTTP status",
+                method
+            )
+        })?;
+        return Err(format!("{} returned HTTP status {}", method, status));
+    }
+
+    serde_json::from_slice(&response.body)
+        .map_err(|error| format!("Invalid JSON from {}: {}", method, error))
 }

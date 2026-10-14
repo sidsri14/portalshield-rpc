@@ -29,8 +29,6 @@ pub struct PolicyConfig {
     pub max_payload_bytes: usize,
     #[serde(default = "default_rate_limit_rps")]
     pub rate_limit_rps: u32,
-    #[serde(default = "default_fail_closed")]
-    pub fail_closed: bool,
 }
 
 fn default_blocked_methods() -> HashSet<String> {
@@ -57,10 +55,6 @@ fn default_rate_limit_rps() -> u32 {
     1000 // requests per second per IP
 }
 
-fn default_fail_closed() -> bool {
-    true
-}
-
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
@@ -68,7 +62,6 @@ impl Default for PolicyConfig {
             allowed_methods: HashSet::new(),
             max_payload_bytes: default_max_payload_bytes(),
             rate_limit_rps: default_rate_limit_rps(),
-            fail_closed: default_fail_closed(),
         }
     }
 }
@@ -164,7 +157,6 @@ mod tests {
         assert_eq!(cfg.listen_addr, "0.0.0.0:9944");
         assert_eq!(cfg.upstreams.len(), 2);
         assert!(cfg.policy.blocked_methods.contains("author_insertKey"));
-        assert!(cfg.policy.fail_closed);
         assert_eq!(cfg.health.probe_interval_secs, 5);
     }
 
@@ -179,4 +171,3 @@ mod tests {
         assert_eq!(cfg.upstreams.len(), deserialized.upstreams.len());
     }
 }
-

@@ -2,16 +2,10 @@
   "listen_addr": "0.0.0.0:9944",
   "upstreams": [
     {
-      "name": "portaldot-validator-primary",
-      "url": "http://127.0.0.1:9933",
+      "name": "portaldot-mainnet",
+      "url": "wss://mainnet.portaldot.io",
       "weight": 100,
       "priority": 1
-    },
-    {
-      "name": "portaldot-fullnode-backup",
-      "url": "http://127.0.0.1:9934",
-      "weight": 80,
-      "priority": 2
     }
   ],
   "policy": {
@@ -29,14 +23,13 @@
     ],
     "allowed_methods": [],
     "max_payload_bytes": 5242880,
-    "rate_limit_rps": 1000,
-    "fail_closed": true
+    "rate_limit_rps": 1000
   },
   "health": {
     "probe_interval_secs": 5,
     "max_block_lag": 10,
     "min_peers": 1,
-    "expected_chain": "Portaldot",
+    "expected_chain": "Portaldot Mainnet",
     "timeout_ms": 3000
   }
 }

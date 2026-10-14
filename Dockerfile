@@ -1,11 +1,11 @@
 # Build stage
-FROM rust:1.80-slim-bookworm as builder
+FROM rust:1.88-slim-bookworm AS builder
 
 WORKDIR /usr/src/portalshield-rpc
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release
+RUN cargo build --release --locked
 
 # Runtime stage
 FROM debian:bookworm-slim

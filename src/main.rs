@@ -4,6 +4,7 @@ use portalshield_rpc::{
     health::{HealthMonitor, NodeState, SharedNodePool},
     policy::PolicyEngine,
     proxy::ProxyEngine,
+    rate_limit::RateLimiter,
     server::{create_router, AppState},
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration, time::Instant};
@@ -39,11 +40,7 @@ struct Args {
     #[arg(long, help = "Expected Portaldot chain name (e.g., 'Portaldot')")]
     expected_chain: Option<String>,
 
-    #[arg(
-        long,
-        default_value = "5",
-        help = "Health probe interval in seconds"
-    )]
+    #[arg(long, default_value = "5", help = "Health probe interval in seconds")]
     probe_interval: u64,
 
     #[arg(
@@ -53,11 +50,7 @@ struct Args {
     )]
     max_block_lag: u64,
 
-    #[arg(
-        short,
-        long,
-        help = "Optional path to JSON config file"
-    )]
+    #[arg(short, long, help = "Optional path to JSON config file")]
     config: Option<String>,
 }
 
@@ -68,8 +61,7 @@ async fn main() -> anyhow::Result<()> {
         .with_max_level(Level::INFO)
         .with_target(false)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     let args = Args::parse();
 
@@ -117,11 +109,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 3. Initialize node state pool
-    let initial_states: Vec<NodeState> = config
-        .upstreams
-        .iter()
-        .map(NodeState::new)
-        .collect();
+    let initial_states: Vec<NodeState> = config.upstreams.iter().map(NodeState::new).collect();
     let nodes: SharedNodePool = Arc::new(RwLock::new(initial_states));
 
     // 4. Initialize Policy & Proxy Engines
@@ -134,11 +122,11 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Start Health Monitor
     let health_monitor = Arc::new(HealthMonitor::new(nodes.clone(), config.health.clone()));
-    
+
     // Run immediate probe cycle
     info!("Executing initial upstream probe cycle...");
     health_monitor.run_probe_cycle().await;
-    
+
     // Spawn background health polling loop
     health_monitor.clone().start_background_loop();
 
@@ -146,10 +134,11 @@ async fn main() -> anyhow::Result<()> {
     let app_state = Arc::new(AppState {
         proxy,
         nodes: nodes.clone(),
+        rate_limiter: Arc::new(RateLimiter::new(config.policy.rate_limit_rps)),
         start_time: Instant::now(),
     });
 
-    let app = create_router(app_state);
+    let app = create_router(app_state, config.policy.max_payload_bytes);
 
     let addr: SocketAddr = config.listen_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -158,9 +147,12 @@ async fn main() -> anyhow::Result<()> {
     info!("Prometheus metrics available at http://{}/metrics", addr);
     info!("Node health available at http://{}/health", addr);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     info!("PortalShield RPC Gateway shutdown cleanly");
     Ok(())

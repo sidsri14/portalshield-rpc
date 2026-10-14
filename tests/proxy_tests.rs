@@ -1,4 +1,4 @@
-use axum::{routing::post, Json, Router};
+use axum::{http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 use portalshield_rpc::{
     config::{PolicyConfig, UpstreamConfig},
     error::GatewayError,
@@ -156,4 +156,135 @@ async fn test_proxy_failover_to_backup_upstream() {
     let resp_bytes = res.unwrap();
     let resp_val: Value = serde_json::from_slice(&resp_bytes).unwrap();
     assert_eq!(resp_val.get("id"), Some(&json!(777)));
+}
+
+#[tokio::test]
+async fn test_proxy_does_not_replay_write_like_request() {
+    let app = Router::new().route("/", post(mock_rpc_server));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backup_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let pool: SharedNodePool = Arc::new(RwLock::new(vec![
+        NodeState::new(&UpstreamConfig {
+            name: "dead-primary".to_string(),
+            url: "http://127.0.0.1:9".to_string(),
+            weight: 100,
+            priority: 1,
+        }),
+        NodeState::new(&UpstreamConfig {
+            name: "healthy-backup".to_string(),
+            url: format!("http://{}", backup_addr),
+            weight: 80,
+            priority: 2,
+        }),
+    ]));
+    let proxy = ProxyEngine::new(
+        pool,
+        Arc::new(PolicyEngine::new(PolicyConfig::default())),
+        Duration::from_millis(500),
+    );
+    let request = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "author_submitExtrinsic",
+        "params": ["0x1234"]
+    }))
+    .unwrap();
+
+    assert!(matches!(
+        proxy.process_request(&request).await,
+        Err(GatewayError::UpstreamError(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_proxy_does_not_fail_over_on_non_retryable_http_status() {
+    let failing = Router::new().route(
+        "/",
+        post(|| async { (StatusCode::BAD_REQUEST, "invalid request").into_response() }),
+    );
+    let failing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failing_addr = failing_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(failing_listener, failing).await.unwrap() });
+
+    let backup = Router::new().route("/", post(mock_rpc_server));
+    let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backup_addr = backup_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(backup_listener, backup).await.unwrap() });
+
+    let pool: SharedNodePool = Arc::new(RwLock::new(vec![
+        NodeState::new(&UpstreamConfig {
+            name: "bad-request-primary".to_string(),
+            url: format!("http://{}", failing_addr),
+            weight: 100,
+            priority: 1,
+        }),
+        NodeState::new(&UpstreamConfig {
+            name: "healthy-backup".to_string(),
+            url: format!("http://{}", backup_addr),
+            weight: 80,
+            priority: 2,
+        }),
+    ]));
+    let proxy = ProxyEngine::new(
+        pool,
+        Arc::new(PolicyEngine::new(PolicyConfig::default())),
+        Duration::from_secs(1),
+    );
+    let request = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "chain_getHeader",
+        "params": []
+    }))
+    .unwrap();
+
+    let error = proxy.process_request(&request).await.unwrap_err();
+    assert!(matches!(error, GatewayError::UpstreamError(message) if message.contains("400")));
+}
+
+#[tokio::test]
+async fn test_proxy_fails_over_on_retryable_http_status() {
+    let failing = Router::new().route(
+        "/",
+        post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "try later").into_response() }),
+    );
+    let failing_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failing_addr = failing_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(failing_listener, failing).await.unwrap() });
+
+    let backup = Router::new().route("/", post(mock_rpc_server));
+    let backup_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backup_addr = backup_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(backup_listener, backup).await.unwrap() });
+
+    let pool: SharedNodePool = Arc::new(RwLock::new(vec![
+        NodeState::new(&UpstreamConfig {
+            name: "unavailable-primary".to_string(),
+            url: format!("http://{}", failing_addr),
+            weight: 100,
+            priority: 1,
+        }),
+        NodeState::new(&UpstreamConfig {
+            name: "healthy-backup".to_string(),
+            url: format!("http://{}", backup_addr),
+            weight: 80,
+            priority: 2,
+        }),
+    ]));
+    let proxy = ProxyEngine::new(
+        pool,
+        Arc::new(PolicyEngine::new(PolicyConfig::default())),
+        Duration::from_secs(1),
+    );
+    let request = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "chain_getHeader",
+        "params": []
+    }))
+    .unwrap();
+
+    assert!(proxy.process_request(&request).await.is_ok());
 }

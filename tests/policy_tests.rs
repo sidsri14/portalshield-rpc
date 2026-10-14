@@ -116,8 +116,10 @@ fn test_inspect_batch_rpc() {
 
 #[test]
 fn test_oversized_payload_rejected() {
-    let mut config = PolicyConfig::default();
-    config.max_payload_bytes = 100; // artificially small 100 bytes
+    let config = PolicyConfig {
+        max_payload_bytes: 100,
+        ..PolicyConfig::default()
+    };
     let policy = PolicyEngine::new(config);
 
     let large_str = "x".repeat(200);
@@ -145,4 +147,34 @@ fn test_malformed_json_rejected() {
     let res = policy.inspect_bytes(malformed);
     assert!(res.is_err());
     assert!(matches!(res.unwrap_err(), GatewayError::InvalidRequest(_)));
+}
+
+#[test]
+fn test_retry_safety_is_conservative() {
+    let policy = PolicyEngine::new(PolicyConfig::default());
+
+    let safe = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "chain_getHeader",
+        "params": []
+    }))
+    .unwrap();
+    assert!(policy.inspect_bytes(&safe).unwrap().is_retry_safe());
+
+    let write = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "author_submitExtrinsic",
+        "params": ["0x1234"]
+    }))
+    .unwrap();
+    assert!(!policy.inspect_bytes(&write).unwrap().is_retry_safe());
+
+    let mixed_batch = serde_json::to_vec(&json!([
+        {"jsonrpc": "2.0", "id": 3, "method": "system_health", "params": []},
+        {"jsonrpc": "2.0", "id": 4, "method": "author_submitExtrinsic", "params": ["0x1234"]}
+    ]))
+    .unwrap();
+    assert!(!policy.inspect_bytes(&mixed_batch).unwrap().is_retry_safe());
 }

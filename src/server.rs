@@ -1,43 +1,87 @@
 use crate::error::GatewayError;
 use crate::health::{NodeState, SharedNodePool};
-use crate::metrics::export_metrics;
+use crate::metrics::{export_metrics, POLICY_REJECTIONS_TOTAL};
 use crate::proxy::ProxyEngine;
+use crate::rate_limit::RateLimiter;
 use axum::{
-    body::Bytes,
-    extract::State,
-    http::{header, HeaderMap, StatusCode},
+    body::{Body, Bytes},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
-use tower_http::cors::{Any, CorsLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use tracing::warn;
 
 pub struct AppState {
     pub proxy: Arc<ProxyEngine>,
     pub nodes: SharedNodePool,
+    pub rate_limiter: Arc<RateLimiter>,
     pub start_time: Instant,
 }
 
-pub fn create_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+pub fn create_router(state: Arc<AppState>, max_payload_bytes: usize) -> Router {
+    let rpc_route =
+        Router::new()
+            .route("/", post(handle_rpc))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                enforce_rate_limit,
+            ));
 
     Router::new()
-        .route("/", post(handle_rpc).get(handle_dashboard))
+        .route("/", get(handle_dashboard))
         .route("/health", get(handle_health))
         .route("/status", get(handle_status))
         .route("/metrics", get(handle_metrics))
         .route("/dashboard", get(handle_dashboard))
-        .layer(cors)
+        .merge(rpc_route)
+        .layer(DefaultBodyLimit::max(max_payload_bytes))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static(
+                "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+            ),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn enforce_rate_limit(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.rate_limiter.allow(peer_addr.ip()).await {
+        return next.run(request).await;
+    }
+
+    POLICY_REJECTIONS_TOTAL
+        .with_label_values(&["unknown", "rate_limit"])
+        .inc();
+    let error = GatewayError::RateLimitExceeded;
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::CONTENT_TYPE, "application/json")],
+        error.to_jsonrpc_response(None).to_string(),
+    )
+        .into_response()
 }
 
 async fn handle_rpc(
@@ -63,8 +107,11 @@ async fn handle_rpc(
             let status_code = match err {
                 GatewayError::PolicyViolation(_) => StatusCode::FORBIDDEN,
                 GatewayError::PayloadTooLarge(_, _) => StatusCode::PAYLOAD_TOO_LARGE,
+                GatewayError::RateLimitExceeded => StatusCode::TOO_MANY_REQUESTS,
                 GatewayError::NoHealthyUpstream => StatusCode::SERVICE_UNAVAILABLE,
-                _ => StatusCode::BAD_REQUEST,
+                GatewayError::UpstreamError(_) => StatusCode::BAD_GATEWAY,
+                GatewayError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+                GatewayError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
             };
             (
                 status_code,
@@ -99,13 +146,52 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse 
         "version": env!("CARGO_PKG_VERSION")
     });
 
-    (StatusCode::OK, Json(payload))
+    let http_status = if available > 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (http_status, Json(payload))
 }
 
 async fn handle_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pool = state.nodes.read().await;
-    let nodes_list: Vec<NodeState> = pool.clone();
+    let nodes_list: Vec<PublicNodeState> = pool.iter().map(PublicNodeState::from).collect();
     (StatusCode::OK, Json(nodes_list))
+}
+
+#[derive(Serialize)]
+struct PublicNodeState {
+    name: String,
+    weight: u32,
+    priority: u32,
+    status: crate::health::NodeStatus,
+    block_height: u64,
+    block_lag: u64,
+    peers: u32,
+    is_syncing: bool,
+    latency_ms: u64,
+    chain_name: String,
+    last_probe: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<&NodeState> for PublicNodeState {
+    fn from(node: &NodeState) -> Self {
+        Self {
+            name: node.name.clone(),
+            weight: node.weight,
+            priority: node.priority,
+            status: node.status.clone(),
+            block_height: node.block_height,
+            block_lag: node.block_lag,
+            peers: node.peers,
+            is_syncing: node.is_syncing,
+            latency_ms: node.latency_ms,
+            chain_name: node.chain_name.clone(),
+            last_probe: node.last_probe,
+        }
+    }
 }
 
 async fn handle_metrics() -> Response {
@@ -140,9 +226,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PortalShield RPC — Portaldot Node Gateway</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@400;600;700&display=swap" rel="stylesheet">
+    <title>PortalShield RPC - Portaldot Node Gateway</title>
     <style>
         :root {{
             --bg: #090d16;
@@ -162,7 +246,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
         body {{
             background: var(--bg);
             color: var(--text-main);
-            font-family: 'Outfit', sans-serif;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             min-height: 100vh;
             padding: 2rem;
             background-image: 
@@ -212,7 +296,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             padding: 0.4rem 0.8rem;
             border-radius: 9999px;
             font-size: 0.8rem;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
             background: rgba(16, 185, 129, 0.15);
             color: var(--green);
             border: 1px solid rgba(16, 185, 129, 0.3);
@@ -261,7 +345,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
         .stat-val {{
             font-size: 1.8rem;
             font-weight: 700;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
             color: var(--cyan);
         }}
         .stat-lbl {{
@@ -288,7 +372,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
         .nodes-table td {{
             padding: 1rem 0.75rem;
             border-bottom: 1px solid rgba(255,255,255,0.03);
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
         }}
         .status-pill {{
             padding: 0.25rem 0.6rem;
@@ -333,7 +417,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             border-radius: 8px;
             color: var(--text-main);
             padding: 0.75rem;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
             font-size: 0.85rem;
         }}
         select:focus, textarea:focus {{
@@ -345,7 +429,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             background: linear-gradient(135deg, var(--accent), #ff007f);
             color: white;
             font-weight: 600;
-            font-family: 'Outfit', sans-serif;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             cursor: pointer;
             transition: all 0.2s;
             border: none;
@@ -360,7 +444,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             border: 1px solid var(--border);
             border-radius: 8px;
             padding: 1rem;
-            font-family: 'JetBrains Mono', monospace;
+            font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
             font-size: 0.8rem;
             min-height: 140px;
             max-height: 260px;
@@ -400,7 +484,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             <div class="card">
                 <div class="card-header">
                     <h2>Portaldot Node Pool</h2>
-                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: 'JetBrains Mono'">Uptime: {uptime}s</span>
+                    <span style="font-size: 0.8rem; color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace">Uptime: {uptime}s</span>
                 </div>
                 <div class="stats-grid">
                     <div class="stat-box">
@@ -421,7 +505,6 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
                     <thead>
                         <tr>
                             <th>Node</th>
-                            <th>Endpoint</th>
                             <th>Chain</th>
                             <th>Block Height</th>
                             <th>Lag</th>
@@ -429,7 +512,7 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
                         </tr>
                     </thead>
                     <tbody id="nodes-tbody">
-                        <tr><td colspan="6" style="text-align: center; color: var(--text-muted)">Loading real-time upstream telemetry...</td></tr>
+                        <tr><td colspan="5" style="text-align: center; color: var(--text-muted)">Loading real-time upstream telemetry...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -437,12 +520,12 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
             <div class="card">
                 <div class="card-header">
                     <h2>Active Security Policies <span class="policy-tag">FAIL-CLOSED</span></h2>
-                    <a href="/metrics" target="_blank" style="color: var(--cyan); text-decoration: none; font-size: 0.8rem; font-family: 'JetBrains Mono'">Prometheus /metrics &rarr;</a>
+                    <a href="/metrics" target="_blank" rel="noopener" style="color: var(--cyan); text-decoration: none; font-size: 0.8rem; font-family: ui-monospace, SFMono-Regular, Consolas, monospace">Prometheus /metrics &rarr;</a>
                 </div>
                 <div style="font-size: 0.875rem; color: var(--text-muted); line-height: 1.6;">
-                    <p style="margin-bottom: 0.5rem;">🔒 <strong>Dangerous Administration Disallowed:</strong> <code>author_insertKey</code>, <code>author_rotateKeys</code>, <code>author_hasKey</code>, <code>system_addReservedPeer</code>, <code>system_removeReservedPeer</code>, <code>system_nodeRoles</code></p>
-                    <p style="margin-bottom: 0.5rem;">⚡ <strong>Auto-Failover Logic:</strong> Automatically retries request against secondary node before response body begins if primary stalls.</p>
-                    <p>🛡️ <strong>Health Probes:</strong> Probing <code>system_health</code>, <code>chain_getHeader</code>, and <code>system_chain</code> every 5 seconds.</p>
+                    <p style="margin-bottom: 0.5rem;"><strong>Dangerous Administration Disallowed:</strong> <code>author_insertKey</code>, <code>author_rotateKeys</code>, <code>author_hasKey</code>, <code>system_addReservedPeer</code>, <code>system_removeReservedPeer</code>, <code>system_nodeRoles</code></p>
+                    <p style="margin-bottom: 0.5rem;"><strong>Bounded Auto-Failover:</strong> Retries read-only requests once after a transport failure, HTTP 429, or selected 5xx response.</p>
+                    <p><strong>Periodic Health Probes:</strong> Runs <code>system_health</code>, <code>chain_getHeader</code>, and <code>system_chain</code>.</p>
                 </div>
             </div>
         </div>
@@ -497,13 +580,24 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
 
         loadPreset();
 
+        function escapeHtml(value) {{
+            const replacements = {{
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#039;'
+            }};
+            return String(value).replace(/[&<>"']/g, character => replacements[character]);
+        }}
+
         async function fetchStatus() {{
             try {{
                 const res = await fetch('/status');
                 const nodes = await res.json();
                 const tbody = document.getElementById('nodes-tbody');
                 if (nodes.length === 0) {{
-                    tbody.innerHTML = '<tr><td colspan="6" style="text-align:center">No nodes configured</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center">No nodes configured</td></tr>';
                     return;
                 }}
                 let maxLag = 0;
@@ -522,9 +616,8 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
                         }}
                     }}
                     rows += `<tr>
-                        <td><strong>${{n.name}}</strong></td>
-                        <td style="color:var(--text-muted)">${{n.url}}</td>
-                        <td>${{n.chain_name || '—'}}</td>
+                        <td><strong>${{escapeHtml(n.name)}}</strong></td>
+                        <td>${{escapeHtml(n.chain_name || '-')}}</td>
                         <td>#${{n.block_height}}</td>
                         <td>${{n.block_lag}} blks</td>
                         <td><span class="status-pill ${{statusClass}}">${{statusText}}</span></td>
@@ -576,4 +669,25 @@ async fn handle_dashboard(State(state): State<Arc<AppState>>) -> Html<String> {
     );
 
     Html(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::UpstreamConfig;
+
+    #[test]
+    fn public_node_state_does_not_expose_upstream_url() {
+        let node = NodeState::new(&UpstreamConfig {
+            name: "primary".to_string(),
+            url: "https://user:secret@example.com/rpc?token=sensitive".to_string(),
+            weight: 100,
+            priority: 1,
+        });
+
+        let serialized = serde_json::to_string(&PublicNodeState::from(&node)).unwrap();
+        assert!(!serialized.contains("secret"));
+        assert!(!serialized.contains("sensitive"));
+        assert!(!serialized.contains("url"));
+    }
 }

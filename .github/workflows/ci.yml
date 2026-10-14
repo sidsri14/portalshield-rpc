@@ -30,8 +30,14 @@ jobs:
     - name: Rust Cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Check Formatting & Compilation
-      run: cargo check --all-targets --verbose
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Check compilation
+      run: cargo check --locked --all-targets --verbose
+
+    - name: Run Clippy
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
     - name: Run Test Suite
-      run: cargo test --all-targets --verbose
+      run: cargo test --locked --all-targets --verbose

@@ -2,8 +2,8 @@ use axum::{routing::post, Json, Router};
 use portalshield_rpc::{
     config::UpstreamConfig,
     health::{HealthMonitor, NodeState, NodeStatus},
+    transport::RpcClient,
 };
-use reqwest::Client;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -98,10 +98,7 @@ async fn test_probe_node_against_mock_portaldot() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let client = Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
+    let client = RpcClient::new(Duration::from_secs(2));
 
     let url = format!("http://{}", addr);
 
