@@ -162,6 +162,25 @@ It records a real `system_chain` request proxied through PortalShield to
 `wss://mainnet.portaldot.io`. Block height, peer count, and latency are a
 snapshot, not performance claims.
 
+## Demo video
+
+The demo recorder starts the release binary against the documented Portaldot
+mainnet WebSocket endpoint, drives the operator dashboard in Chromium, and
+records a 1440x900 walkthrough. The build script adds narration and generated
+subtitles. It requires Node.js, `ffmpeg`, `uvx`, and a Chromium-compatible
+browser.
+
+```bash
+cargo build --release --locked
+cd demo
+npm ci
+npm run record
+npm run build
+```
+
+The final local artifact is `demo/output/portalshield-demo.mp4`. Generated
+media and installed Node packages are intentionally excluded from Git.
+
 ## Current boundaries
 
 - Client ingress is HTTP JSON-RPC. WebSocket subscriptions are not proxied.
