@@ -166,8 +166,9 @@ snapshot, not performance claims.
 
 The demo recorder starts the release binary against the documented Portaldot
 mainnet WebSocket endpoint, drives the operator dashboard in Chromium, and
-records a 1440x900 walkthrough. The build script adds narration and generated
-subtitles. It requires Node.js, `ffmpeg`, `uvx`, and a Chromium-compatible
+records a 1440x900 walkthrough. The build script combines the checked-in local
+neural narration with generated, time-aligned subtitles and normalizes the
+audio for playback. It requires Node.js, `ffmpeg`, and a Chromium-compatible
 browser.
 
 ```bash
@@ -179,7 +180,9 @@ npm run build
 ```
 
 The final local artifact is `demo/output/portalshield-demo.mp4`. Generated
-media and installed Node packages are intentionally excluded from Git.
+media and installed Node packages are intentionally excluded from Git; the
+source narration in `demo/portalshield-narration.wav` is versioned so the build
+does not depend on a cloud text-to-speech service.
 
 ## Current boundaries
 
